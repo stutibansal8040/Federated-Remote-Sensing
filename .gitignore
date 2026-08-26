@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Training outputs
+*.out
+*.err
+*.o[0-9]*
+*.e[0-9]*
+
+# Logs
+log/
+logs/
+*.log
+
+# Model checkpoints / large training artifacts
+*.pt
+*.pth
+*.ckpt
+
+# TensorBoard
+runs/
+events.out.tfevents.*
+
+# Temporary files
+*.tmp
+*.bak
+*~
