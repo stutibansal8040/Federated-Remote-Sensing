@@ -90,12 +90,27 @@ class ResNet18(nn.Module):
     def __init__(self,
                  name,
                  inplanes=64,
-                 num_classes=21):
+                 num_classes=45):
         super(ResNet18, self).__init__()
         self.name = name
         self.block = BasicBlock
         self.layer_nums = [2, 2, 2, 2]
         self.num_classes = num_classes
+
+        # Global class prototypes.
+        # These are updated by the server after each federated round.
+        self.register_buffer(
+            "global_prototypes",
+            torch.zeros(num_classes, dim)
+        )
+
+        self.register_buffer(
+            "global_prototype_valid",
+            torch.zeros(
+                num_classes,
+                dtype=torch.bool
+            )
+        )
         self.inplanes = inplanes
         self.planes = [inplanes, inplanes * 2, inplanes * 4, inplanes * 8]
         self.expansion = 1 

@@ -12,12 +12,16 @@ from src.server import Server
 
 # Usage:
 # python main_experiment.py path/to/config.yaml
+# python main_experiment.py path/to/config.yaml --resume
 if len(sys.argv) > 1:
     config_file = sys.argv[1]
 else:
     config_file = "./config_adaptive.yaml"
 
+resume = "--resume" in sys.argv[2:]
+
 print(f"[INFO] Using configuration: {config_file}")
+print(f"[INFO] Resume mode: {resume}")
 
 with open(config_file) as c:
     configs = list(yaml.load_all(c, Loader=yaml.FullLoader))
@@ -44,6 +48,8 @@ loss_config = get_config("loss_config")
 adaptive_gamma_config = get_config("adaptive_gamma", {})
 temp_queue_config = get_config("temp_queue", {})
 logit_adjustment_config = get_config("logit_adjustment", {})
+global_prototype_config = get_config("global_prototype_config", {})
+decorrelation_config = get_config("decorrelation_config", {})
 
 
 # Give every experiment a unique log directory
@@ -101,11 +107,34 @@ central_server = Server(
     loss_config,
     adaptive_gamma_config,
     temp_queue_config,
-    logit_adjustment_config
+    logit_adjustment_config,
+    global_prototype_config
 )
 
-central_server.setup()
-central_server.fit()
+# ---------------------------------------------------------
+# Checkpoint / resume paths
+# ---------------------------------------------------------
+checkpoint_dir = os.path.join(
+    "checkpoints",
+    experiment_name
+)
+
+metrics_file = os.path.join(
+    "results",
+    experiment_name,
+    "metrics.csv"
+)
+
+central_server.setup(
+    decorrelation_config=decorrelation_config,
+    global_prototype_config=global_prototype_config
+)
+
+central_server.fit(
+    resume=resume,
+    checkpoint_dir=checkpoint_dir,
+    metrics_file=metrics_file
+)
 
 
 with open(

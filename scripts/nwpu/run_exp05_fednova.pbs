@@ -1,0 +1,42 @@
+#!/bin/bash
+#PBS -N nwpu_exp05_fednova
+#PBS -q gpu
+#PBS -l select=1:ncpus=8:ngpus=1:host=gpu01
+#PBS -l walltime=12:00:00
+
+cd "$PBS_O_WORKDIR"
+
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate rsccl
+
+# Select an actually free physical GPU
+source scripts/nwpu/select_free_gpu.sh
+
+
+echo "======================================"
+echo "NWPU EXP-05: FedNova Baseline"
+echo "Experiment: EXP-05 FedNova"
+echo "Rounds: 1000"
+echo "======================================"
+echo "Host: $(hostname)"
+echo "Start: $(date)"
+echo "PBS assigned CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-NOT_SET}"
+
+python - <<'PYTHON'
+import os
+import torch
+
+print("CUDA_VISIBLE_DEVICES:", os.environ.get("CUDA_VISIBLE_DEVICES"))
+print("CUDA available:", torch.cuda.is_available())
+print("GPU count visible to PyTorch:", torch.cuda.device_count())
+
+if torch.cuda.is_available():
+    print("Visible GPU 0:", torch.cuda.get_device_name(0))
+else:
+    raise RuntimeError("No GPU visible inside PBS job")
+PYTHON
+
+python main_experiment.py \
+    configs/nwpu/exp05_fednova.yaml
+
+echo "FINISHED: $(date)"

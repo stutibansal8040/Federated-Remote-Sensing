@@ -8,7 +8,7 @@ def flatten(t):
     return t.reshape(t.shape[0], -1)
 
 class MoCo(nn.Module):
-    def __init__(self, base_encoder, name, dim=128, K=65536, T=0.2, mlp=False, feat_dim=512, num_classes=21):
+    def __init__(self, base_encoder, name, dim=128, K=65536, T=0.2, mlp=False, feat_dim=512, num_classes=45):
         super(MoCo, self).__init__()
         self.K = K
         self.T = T

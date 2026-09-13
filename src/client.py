@@ -39,6 +39,14 @@ class Client(object):
         self.gamma = None
         self.adaptive_gamma_config = {}
 
+        # Global prototype statistics
+        self.local_prototype_sums = None
+        self.local_prototype_counts = None
+
+        # Feature decorrelation regularization
+        self.decorrelation_config = {}
+        self.global_prototype_config = {}
+
     @property
     def model(self):
         """Local model getter for parameter aggregation."""
@@ -69,6 +77,21 @@ class Client(object):
         self.optim_config = client_config["optim_config"]
         self.criterion_cl = client_config["criterion_cl"]
         self.loss_config = client_config["loss_config"]
+
+        self.decorrelation_config = client_config.get(
+            "decorrelation_config",
+            {
+                "enabled": False,
+                "lambda": 0.01,
+                "num_features": 256
+            }
+        )
+
+        self.global_prototype_config = client_config.get(
+            "global_prototype_config",
+            {}
+        )
+
         self.focal_loss = FocalLoss()
 
         # ---------------------------------------------------------
@@ -137,7 +160,7 @@ class Client(object):
                 self.gamma
             ) = get_client_adaptive_gamma(
                 self.data,
-                num_classes=21,
+                num_classes=45,
                 gamma_min=gamma_min,
                 gamma_max=gamma_max
             )
@@ -271,22 +294,10 @@ class Client(object):
             **self.optim_config
         )
     
-        print(
-            f"Client {self.id}: entered client_update_cl",
-            flush=True
-        )
     
         for e in range(self.local_epoch):
     
-            print(
-                f"Client {self.id}: epoch {e} start",
-                flush=True
-            )
     
-            print(
-                f"Client {self.id}: entering dataloader",
-                flush=True
-            )
     
             self._debug_log(
                 f"[DEBUG] Client {self.id} BEFORE dataloader "
@@ -300,20 +311,12 @@ class Client(object):
                     f"round={round_number} batch={batch_idx}"
                 )
     
-                print(
-                    f"Client {self.id}: batch {batch_idx} loaded",
-                    flush=True
-                )
     
                 data[0] = data[0].float().to(self.device)
                 data[1] = data[1].float().to(self.device)
     
                 labels = labels.long().to(self.device)
     
-                print(
-                    f"Client {self.id}: before model",
-                    flush=True
-                )
     
                 self._debug_log(
                     f"[DEBUG] Client {self.id} BEFORE model "
@@ -326,15 +329,49 @@ class Client(object):
                     labels=labels
                 )
 
+                # -----------------------------------------------------
+                # Global prototype statistics
+                # -----------------------------------------------------
+                if self.global_prototype_config.get("enabled", False):
+
+                    batch_size = data[0].size(0)
+                    q_features = features[:batch_size].detach()
+
+                    num_classes = logits.size(1)
+                    feature_dim = q_features.size(1)
+
+                    if self.local_prototype_sums is None:
+                        self.local_prototype_sums = torch.zeros(
+                            num_classes,
+                            feature_dim,
+                            device=self.device
+                        )
+
+                        self.local_prototype_counts = torch.zeros(
+                            num_classes,
+                            dtype=torch.long,
+                            device=self.device
+                        )
+
+                    for class_id in range(num_classes):
+
+                        mask = labels[:batch_size] == class_id
+
+                        if mask.any():
+
+                            self.local_prototype_sums[class_id] += (
+                                q_features[mask].sum(dim=0)
+                            )
+
+                            self.local_prototype_counts[class_id] += (
+                                mask.sum()
+                            )
+
                 self._debug_log(
                     f"[DEBUG] Client {self.id} AFTER model "
                     f"round={round_number} batch={batch_idx}"
                 )
     
-                print(
-                    f"Client {self.id}: after model",
-                    flush=True
-                )
     
                 if self.loss_config["loss"] == "ccloss":
 
@@ -343,7 +380,8 @@ class Client(object):
                         f"round={round_number} batch={batch_idx}"
                     )
 
-                    loss = self.criterion_cl(
+                    # Base RS-CCL loss
+                    lccl_loss = self.criterion_cl(
                         features,
                         labels,
                         logits,
@@ -353,6 +391,45 @@ class Client(object):
                         class_counts=self.class_counts,
                         logit_adjust_tau=self.logit_adjust_tau
                     )
+
+                    # -------------------------------------------------
+                    # Feature decorrelation regularizer
+                    # -------------------------------------------------
+                    decorr_cfg = self.decorrelation_config
+
+                    if decorr_cfg.get("enabled", False):
+
+                        batch_size = data[0].size(0)
+                        q_features = features[:batch_size]
+
+                        decorr_loss = feature_decorrelation_loss(
+                            q_features,
+                            num_features=decorr_cfg.get(
+                                "num_features",
+                                256
+                            )
+                        )
+
+                        decorr_lambda = float(
+                            decorr_cfg.get("lambda", 0.01)
+                        )
+
+                        loss = (
+                            lccl_loss
+                            + decorr_lambda * decorr_loss
+                        )
+
+                        if batch_idx == 0:
+                            print(
+                                f"Client {self.id}: "
+                                f"LCCL={lccl_loss.item():.6f}, "
+                                f"Decorr={decorr_loss.item():.6f}, "
+                                f"lambda={decorr_lambda}",
+                                flush=True
+                            )
+
+                    else:
+                        loss = lccl_loss
 
                     self._debug_log(
                         f"[DEBUG] Client {self.id} AFTER CCLoss "
@@ -366,10 +443,6 @@ class Client(object):
                         labels[:logits.size(0)]
                     )
     
-                print(
-                    f"Client {self.id}: after loss",
-                    flush=True
-                )
     
                 optimizer.zero_grad()
     
@@ -385,10 +458,6 @@ class Client(object):
                     f"round={round_number} batch={batch_idx}"
                 )
     
-                print(
-                    f"Client {self.id}: after backward",
-                    flush=True
-                )
     
                 self._debug_log(
                     f"[DEBUG] Client {self.id} BEFORE optimizer.step "
@@ -403,10 +472,6 @@ class Client(object):
                 )
 
     
-                print(
-                    f"Client {self.id}: after step",
-                    flush=True
-                )
     
                 # Release batch tensors and their computation graphs
                 del loss, features, logits
@@ -417,6 +482,20 @@ class Client(object):
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
     
+        # ---------------------------------------------------------
+        # Save local prototype statistics for server aggregation
+        # ---------------------------------------------------------
+        if self.global_prototype_config.get("enabled", False):
+
+            if self.local_prototype_sums is not None:
+                self.local_prototype_sums = (
+                    self.local_prototype_sums.detach().cpu()
+                )
+
+                self.local_prototype_counts = (
+                    self.local_prototype_counts.detach().cpu()
+                )
+
         # ---------------------------------------------------------
         # Local training complete: move model back to CPU
         # ---------------------------------------------------------

@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class CCLoss(nn.Module):
-    def __init__(self, gamma, temperature=0.05, K=100, num_classes=21):
+    def __init__(self, gamma, temperature=0.05, K=100, num_classes=45):
         super(CCLoss, self).__init__()
         self.gamma = gamma
         self.temperature = temperature
@@ -13,202 +13,164 @@ class CCLoss(nn.Module):
     def forward(
         self,
         features,
-        labels=None,
-        sup_logits=None,
-        gamma=None,
-        temperature=None,
-        queue_size=None,
+        labels,
+        sup_logits,
+        gamma=0.05,
+        temperature=0.05,
+        queue_size=50,
         class_counts=None,
         logit_adjust_tau=0.0
     ):
+        """
+        Clean supervised contrastive classification loss.
+
+        features:   [batch_size, feature_dim]
+        labels:     [batch_size]
+        sup_logits: [batch_size, num_classes]
+        """
+
         device = features.device
 
-        if gamma is None:
-            gamma = self.gamma
+        # ----------------------------------------------------
+        # BASIC SANITY CHECKS
+        # ----------------------------------------------------
+        if labels.dim() > 1:
+            labels = labels.view(-1)
 
-        if temperature is None:
-            temperature = self.temperature
+        labels = labels.long().to(device)
 
-        if queue_size is None:
-            queue_size = self.K
-
-        queue_size = int(queue_size)
-
-        if queue_size <= 0:
-            raise ValueError(
-                f"queue_size must be positive, got {queue_size}"
-            )
-
-        if queue_size > self.K:
-            raise ValueError(
-                f"queue_size={queue_size} exceeds "
-                f"maximum K={self.K}"
-            )
-
-        # features contains:
-        #   Q features
-        #   K positive features
-        #   physical queue of size self.K
+        # ----------------------------------------------------
+        # ALIGN CURRENT-BATCH FEATURES WITH LABELS AND LOGITS
+        # ----------------------------------------------------
         #
-        # Only the first queue_size entries of the
-        # physical queue participate in this round.
-        total_feature_dim = features.shape[0]
-
-        # Feature layout from MoCo:
-        # [B query features] + [B key features] + [K queue features]
+        # The model may return additional queue/memory features.
+        # Example:
+        #   current batch: 20 features
+        #   queue:         50 features
+        #   total:         70 features
         #
-        # Therefore:
-        # total_feature_dim = 2 * bs + self.K
-        remaining_features = total_feature_dim - self.K
+        # Labels and supervised logits correspond only to the
+        # current batch, so keep only that portion here.
 
-        if remaining_features <= 0:
-            raise ValueError(
-                f"Invalid feature layout: "
-                f"features={features.shape}, K={self.K}"
+        # sup_logits represents the current supervised batch.
+        # features and labels may additionally contain queue/memory entries.
+        batch_size = sup_logits.size(0)
+
+        if labels.numel() < batch_size:
+            raise RuntimeError(
+                f"CCLoss size mismatch: labels batch={labels.numel()} "
+                f"is smaller than logits batch={batch_size}"
             )
 
-        if remaining_features % 2 != 0:
-            raise ValueError(
-                f"Invalid feature layout: expected 2*bs + K entries, "
-                f"got features={total_feature_dim}, K={self.K}"
+        if features.size(0) < batch_size:
+            raise RuntimeError(
+                f"CCLoss size mismatch: features batch={features.size(0)} "
+                f"is smaller than logits batch={batch_size}"
             )
 
-        bs = remaining_features // 2
+        # Keep only current-batch entries for supervised alignment.
+        labels = labels[:batch_size]
 
-        if bs <= 0:
-            raise ValueError(
-                f"Invalid feature layout: "
-                f"features={features.shape}, K={self.K}"
+        if features.size(0) > batch_size:
+            features = features[:batch_size]
+
+        num_classes = sup_logits.size(1)
+
+
+        label_min = int(labels.min().detach().cpu())
+        label_max = int(labels.max().detach().cpu())
+
+        if label_min < 0 or label_max >= num_classes:
+            raise RuntimeError(
+                f"CCLoss label out of range: "
+                f"min={label_min}, max={label_max}, "
+                f"logit_classes={num_classes}"
             )
 
-        queue_start = 2 * bs
-        queue_end = queue_start + queue_size
-
-        if queue_end > total_feature_dim:
-            raise ValueError(
-                f"queue_end={queue_end} exceeds "
-                f"feature dimension={total_feature_dim}"
-            )
-
-        # Keep Q + K positives and only the active queue.
-        active_features = torch.cat(
-            (
-                features[:2 * bs],
-                features[queue_start:queue_end]
-            ),
-            dim=0
-        )
-
-        feature_sim = (
-            torch.matmul(
-                features[:bs],
-                active_features.T
-            ) / temperature
-        )
-
-        # The contrastive similarity is computed only for the B query
-        # features. The supervised logits may contain entries for both
-        # query and key features (2B), so keep only the query portion.
-        if sup_logits is None:
-            raise ValueError("sup_logits must not be None")
-
-        if sup_logits.shape[0] == 2 * bs:
-            sup_logits = sup_logits[:bs]
-        elif sup_logits.shape[0] != bs:
-            raise ValueError(
-                f"Invalid sup_logits shape: {sup_logits.shape}; "
-                f"expected first dimension {bs} or {2 * bs}"
-            )
-
-        # -------------------------------------------------
-        # Local class-frequency logit adjustment
-        # -------------------------------------------------
-        # p_c = n_c / sum(n_c)
-        # adjusted_logit_c = logit_c - tau * log(p_c)
-        #
-        # This compensates for the bias toward classes that
-        # occur more frequently on an individual client.
+        # ----------------------------------------------------
+        # CLASSIFICATION LOSS
+        # ----------------------------------------------------
         if class_counts is not None and logit_adjust_tau > 0:
-            # class_counts may come from the client as a
-            # Python list, NumPy array, or PyTorch tensor.
-            class_counts = torch.as_tensor(
-                class_counts,
-                device=sup_logits.device,
-                dtype=sup_logits.dtype
+            counts = class_counts.to(device).float()
+
+            if counts.numel() == num_classes:
+                prior = counts / counts.sum().clamp_min(1.0)
+                adjustment = logit_adjust_tau * torch.log(
+                    prior.clamp_min(1e-12)
+                )
+                adjusted_logits = sup_logits + adjustment.unsqueeze(0)
+            else:
+                adjusted_logits = sup_logits
+        else:
+            adjusted_logits = sup_logits
+
+        ce_loss = F.cross_entropy(adjusted_logits, labels)
+
+        # ----------------------------------------------------
+        # SUPERVISED CONTRASTIVE LOSS
+        # ----------------------------------------------------
+
+        # Normalize embeddings
+        features = F.normalize(features, dim=1)
+
+        # Pairwise similarity
+        logits = torch.matmul(features, features.T) / temperature
+
+        # Numerical stability
+        logits = logits - logits.max(dim=1, keepdim=True).values.detach()
+
+        # Remove self-comparisons
+        self_mask = torch.eye(
+            batch_size,
+            device=device,
+            dtype=torch.bool
+        )
+
+        logits_mask = ~self_mask
+
+        # Positive pairs = same label, excluding self
+        positive_mask = labels.unsqueeze(0).eq(
+            labels.unsqueeze(1)
+        ) & logits_mask
+
+        # Denominator: all non-self examples
+        exp_logits = torch.exp(logits) * logits_mask.float()
+
+        denominator = exp_logits.sum(
+            dim=1,
+            keepdim=True
+        ).clamp_min(1e-12)
+
+        log_prob = logits - torch.log(denominator)
+
+        # Number of positive samples for each anchor
+        positive_count = positive_mask.float().sum(dim=1)
+
+        # Only anchors having at least one positive
+        valid = positive_count > 0
+
+        if valid.any():
+            mean_log_prob_pos = (
+                (positive_mask.float() * log_prob).sum(dim=1)
+                / positive_count.clamp_min(1.0)
             )
 
-            class_probs = class_counts / class_counts.sum().clamp_min(1.0)
-            class_probs = class_probs.clamp_min(1e-12)
+            contrastive_loss = -mean_log_prob_pos[valid].mean()
+        else:
+            # No positive pairs in this batch
+            contrastive_loss = torch.zeros(
+                (),
+                device=device,
+                dtype=features.dtype
+            )
 
-            log_prior = torch.log(class_probs)
+        # ----------------------------------------------------
+        # FINAL LOSS
+        # ----------------------------------------------------
+        loss = ce_loss + float(gamma) * contrastive_loss
 
-            if log_prior.numel() != sup_logits.shape[1]:
-                raise ValueError(
-                    f"class_counts has {log_prior.numel()} classes, "
-                    f"but sup_logits has {sup_logits.shape[1]} classes"
-                )
-
-            sup_logits = sup_logits - logit_adjust_tau * log_prior.unsqueeze(0)
-
-        logits_con = torch.cat(
-            (sup_logits, feature_sim),
-            dim=1
-        )
-        logits_max, _ = torch.max(logits_con, dim=1, keepdim=True)
-        logits = logits_con - logits_max.detach()
-
-        labels = labels.contiguous().view(-1, 1)
-
-        active_labels = torch.cat(
-            (
-                labels[:2 * bs],
-                labels[2 * bs:2 * bs + queue_size]
-            ),
-            dim=0
-        )
-
-        con_mask = torch.eq(
-            labels[:bs],
-            active_labels.T
-        ).float().to(device)
-
-        logits_mask = torch.ones_like(con_mask)
-
-        # Remove the query's own positive position.
-        logits_mask[:, 0] = 0
-
-        e_mask = con_mask * logits_mask
-
-        one_hot_label = torch.nn.functional.one_hot(
-            labels[:bs].view(-1,),
-            num_classes=self.num_classes
-        ).to(torch.float32)
-
-        df_mask = torch.cat(
-            (
-                one_hot_label,
-                e_mask * gamma
-            ),
-            dim=1
-        )
-
-        logits_mask = torch.cat(
-            (
-                torch.ones(
-                    bs,
-                    self.num_classes,
-                    device=device
-                ),
-                logits_mask
-            ),
-            dim=1
-        )
-        exp_logits = torch.exp(logits) * logits_mask
-        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-12)
-        mean_log_prob_pos = (df_mask * log_prob).sum(1) / df_mask.sum(1)
-        
-        loss = - mean_log_prob_pos.mean()
         return loss
+
 
 class FocalLoss(nn.Module):
 
@@ -230,3 +192,65 @@ class FocalLoss(nn.Module):
         loss = self.alpha * (1 - pt) ** self.gamma * ce
 
         return loss.mean()
+
+def feature_decorrelation_loss(
+    features,
+    num_features=256,
+    eps=1e-6
+):
+    """
+    Lightweight feature decorrelation regularizer.
+    """
+
+    if features.dim() != 2:
+        raise ValueError(
+            f"Expected features with shape [B, D], got {features.shape}"
+        )
+
+    batch_size, feature_dim = features.shape
+
+    if batch_size < 3:
+        return features.new_zeros(())
+
+    if feature_dim > num_features:
+        indices = torch.randperm(
+            feature_dim,
+            device=features.device
+        )[:num_features]
+
+        z = features[:, indices]
+
+    else:
+        z = features
+
+    # Center features
+    z = z - z.mean(dim=0, keepdim=True)
+
+    # Normalize feature dimensions
+    std = z.std(
+        dim=0,
+        unbiased=False,
+        keepdim=True
+    )
+
+    z = z / (std + eps)
+
+    # Correlation matrix
+    corr = torch.matmul(
+        z.transpose(0, 1),
+        z
+    ) / batch_size
+
+    # Remove diagonal
+    diagonal = torch.diagonal(corr)
+
+    off_diagonal = (
+        corr - torch.diag_embed(diagonal)
+    )
+
+    denom = off_diagonal.numel() - z.size(1)
+
+    if denom <= 0:
+        return features.new_zeros(())
+
+    return off_diagonal.pow(2).sum() / denom

@@ -4,6 +4,7 @@ import logging
 import csv
 import os
 import time
+import random
 import numpy as np
 import torch
 import torch.nn as nn
@@ -102,16 +103,22 @@ class Server(object):
         loss_config={},
         adaptive_gamma_config={},
         temp_queue_config={},
-        logit_adjustment_config={}
-    ): 
+        logit_adjustment_config={},
+        global_prototype_config={}
+    ):
         self.clients = None
         self._round = 0
         self.writer = writer
         self.modelname = model_config["name"]
 
         self.model = src.moco.builder.MoCo(
-                            eval(model_config["name"]), model_config["name"], cl_config["cl_dim"], cl_config["cl_K"], 
-                            cl_config["cl_temp"], model_config["num_classes"])
+            base_encoder=eval(model_config["name"]),
+            name=model_config["name"],
+            dim=cl_config["cl_dim"],
+            K=cl_config["cl_K"],
+            T=cl_config["cl_temp"],
+            num_classes=model_config["num_classes"]
+        )
         self.criterion_cl = CCLoss(gamma=cl_config["cl_gamma"], temperature=cl_config["cl_temp"], 
                                         K=cl_config["cl_K"], num_classes=model_config["num_classes"]).cuda()
 
@@ -142,6 +149,111 @@ class Server(object):
         self.adaptive_gamma_config = adaptive_gamma_config
         self.temp_queue_config = temp_queue_config
         self.logit_adjustment_config = logit_adjustment_config
+        self.global_prototype_config = global_prototype_config
+
+    def save_checkpoint(self, checkpoint_path):
+        """Save the completed federated-learning state for resume."""
+        checkpoint = {
+            "round": self._round,
+            "model_state_dict": {
+                key: value.detach().cpu().clone()
+                for key, value in self.model.state_dict().items()
+            },
+            "results": self.results,
+            "numpy_rng_state": np.random.get_state(),
+            "torch_rng_state": torch.get_rng_state(),
+            "python_rng_state": random.getstate(),
+        }
+
+        if torch.cuda.is_available():
+            checkpoint["cuda_rng_state"] = torch.cuda.get_rng_state_all()
+
+        checkpoint_dir = os.path.dirname(checkpoint_path)
+        if checkpoint_dir:
+            os.makedirs(checkpoint_dir, exist_ok=True)
+
+        tmp_path = checkpoint_path + ".tmp"
+        torch.save(checkpoint, tmp_path)
+        os.replace(tmp_path, checkpoint_path)
+
+        latest_path = os.path.join(
+            checkpoint_dir,
+            "latest.pth"
+        )
+
+        if os.path.abspath(latest_path) != os.path.abspath(checkpoint_path):
+            torch.save(checkpoint, latest_path)
+
+        logging.info(
+            f"Checkpoint saved successfully at round {self._round}: "
+            f"{checkpoint_path}"
+        )
+        print(
+            f"[Checkpoint] Saved round {self._round}: "
+            f"{checkpoint_path}",
+            flush=True
+        )
+
+    def load_checkpoint(self, checkpoint_path):
+        """Restore model, round, results and RNG state from a checkpoint."""
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location="cpu"
+        )
+
+        self.model.load_state_dict(
+            checkpoint["model_state_dict"]
+        )
+
+        self._round = int(checkpoint["round"])
+
+        self.results = checkpoint.get(
+            "results",
+            {
+                "loss": [],
+                "accuracy": [],
+                "precision": [],
+                "recall": [],
+                "f1": [],
+                "round_time": []
+            }
+        )
+
+        if "numpy_rng_state" in checkpoint:
+            np.random.set_state(
+                checkpoint["numpy_rng_state"]
+            )
+
+        if "torch_rng_state" in checkpoint:
+            torch.set_rng_state(
+                checkpoint["torch_rng_state"]
+            )
+
+        if "python_rng_state" in checkpoint:
+            random.setstate(
+                checkpoint["python_rng_state"]
+            )
+
+        if (
+            torch.cuda.is_available()
+            and "cuda_rng_state" in checkpoint
+        ):
+            torch.cuda.set_rng_state_all(
+                checkpoint["cuda_rng_state"]
+            )
+
+        logging.info(
+            f"Checkpoint loaded successfully: "
+            f"round {self._round}"
+        )
+
+        print(
+            f"[Checkpoint] Loaded round {self._round}: "
+            f"{checkpoint_path}",
+            flush=True
+        )
+
+        return self._round
 
     def setup(self, **init_kwargs):
         assert self._round == 0
@@ -363,6 +475,79 @@ class Server(object):
         self.clients[selected_index].client_evaluate()
         return True
 
+    def aggregate_global_prototypes(self, sampled_client_indices):
+        """
+        Aggregate local class prototypes from participating clients.
+
+        Only class-wise feature sums and counts are communicated.
+        Raw client data never leaves the client.
+        """
+
+        num_classes = self.model.linear.out_features
+        dim = self.model.encoder_q.fc[-1].out_features
+
+        total_sums = torch.zeros(
+            num_classes,
+            dim
+        )
+
+        total_counts = torch.zeros(
+            num_classes,
+            dtype=torch.long
+        )
+
+        for idx in sampled_client_indices:
+
+            client = self.clients[idx]
+
+            if client.local_prototype_sums is None:
+                continue
+
+            total_sums += client.local_prototype_sums
+            total_counts += client.local_prototype_counts
+
+        valid = total_counts > 0
+
+        prototypes = torch.zeros_like(total_sums)
+
+        prototypes[valid] = (
+            total_sums[valid]
+            /
+            total_counts[valid].float().unsqueeze(1)
+        )
+
+        # Normalize valid class prototypes.
+        prototypes[valid] = torch.nn.functional.normalize(
+            prototypes[valid],
+            dim=1
+        )
+
+        self.global_prototypes = prototypes
+        self.global_prototype_valid = valid
+
+        with torch.no_grad():
+            self.model.global_prototypes.copy_(
+                prototypes.to(
+                    self.model.global_prototypes.device
+                )
+            )
+
+            self.model.global_prototype_valid.copy_(
+                valid.to(
+                    self.model.global_prototype_valid.device
+                )
+            )
+
+        message = (
+            f"[Round: {str(self._round).zfill(4)}] "
+            f"Global prototypes updated: "
+            f"{valid.sum().item()}/{num_classes} classes available"
+        )
+
+        print(message, flush=True)
+        logging.info(message)
+
+
     def train_federated_model(self):
         """Do federated training."""
         # select pre-defined fraction of clients randomly
@@ -384,6 +569,11 @@ class Server(object):
 
         # average each updated model parameters of the selected clients and update the global model
         self.average_model(sampled_client_indices, mixing_coefficients)
+
+        if self.global_prototype_config.get("enabled", False):
+            self.aggregate_global_prototypes(
+                sampled_client_indices
+            )
         
     def evaluate_global_model(self):
 
@@ -437,7 +627,7 @@ class Server(object):
         ) = calculate_macro_metrics(
             all_labels,
             all_predictions,
-            num_classes=21
+            num_classes=45
         )
 
         return (
@@ -447,40 +637,98 @@ class Server(object):
             test_recall,
             test_f1
         )
-    def fit(self):
-        """Execute the whole process of federated learning."""
+    def fit(
+        self,
+        resume=False,
+        checkpoint_dir="checkpoints",
+        metrics_file=None
+    ):
+        """Execute federated learning with checkpoint/resume support."""
 
-        self.results = {
-            "loss": [],
-            "accuracy": [],
-            "precision": [],
-            "recall": [],
-            "f1": [],
-            "round_time": []
-        }
+        checkpoint_dir = os.path.join(
+            checkpoint_dir,
+            self.dataset_name
+        )
+        os.makedirs(checkpoint_dir, exist_ok=True)
 
-        # Create results directory
-        os.makedirs("results", exist_ok=True)
+        latest_checkpoint = os.path.join(
+            checkpoint_dir,
+            "latest.pth"
+        )
 
-        metrics_file = "results/metrics.csv"
+        # ---------------------------------------------------------
+        # Initialize or resume experiment state
+        # ---------------------------------------------------------
+        if resume and os.path.exists(latest_checkpoint):
+            self.load_checkpoint(latest_checkpoint)
 
-        # Create CSV and write header
-        with open(metrics_file, "w", newline="") as f:
-            writer = csv.writer(f)
+            start_round = self._round + 1
 
-            writer.writerow([
-                "round",
-                "loss",
-                "accuracy",
-                "precision",
-                "recall",
-                "f1",
-                "round_time_sec"
-            ])
+            logging.info(
+                f"Resuming federated learning from round "
+                f"{start_round}"
+            )
+
+            print(
+                f"[Resume] Continuing from round "
+                f"{start_round}",
+                flush=True
+            )
+
+        else:
+            self._round = 0
+
+            self.results = {
+                "loss": [],
+                "accuracy": [],
+                "precision": [],
+                "recall": [],
+                "f1": [],
+                "round_time": []
+            }
+
+            start_round = 1
+
+            print(
+                "[Start] Starting a new federated-learning run.",
+                flush=True
+            )
+
+        # ---------------------------------------------------------
+        # Metrics file
+        # ---------------------------------------------------------
+        if metrics_file is None:
+            metrics_file = os.path.join(
+                "results",
+                "metrics.csv"
+            )
+
+        metrics_dir = os.path.dirname(metrics_file)
+
+        if metrics_dir:
+            os.makedirs(metrics_dir, exist_ok=True)
+
+        # Only create a new metrics file for a fresh run.
+        if start_round == 1:
+            with open(metrics_file, "w", newline="") as f:
+                writer = csv.writer(f)
+
+                writer.writerow([
+                    "round",
+                    "loss",
+                    "accuracy",
+                    "precision",
+                    "recall",
+                    "f1",
+                    "round_time_sec"
+                ])
 
         total_start = time.perf_counter()
 
-        for r in range(self.num_rounds):
+        # ---------------------------------------------------------
+        # Federated training loop
+        # ---------------------------------------------------------
+        for r in range(start_round - 1, self.num_rounds):
 
             round_start = time.perf_counter()
 
@@ -509,7 +757,6 @@ class Server(object):
 
             # Save metrics to CSV
             with open(metrics_file, "a", newline="") as f:
-
                 writer = csv.writer(f)
 
                 writer.writerow([
@@ -553,61 +800,38 @@ class Server(object):
                 f"Evaluate global model's performance...!"
                 f"\n\t[Server] ...finished evaluation!"
                 f"\n\t=> Loss: {test_loss:.4f}"
-                f"\n\t=> Accuracy: {100.0 * test_accuracy:.2f}%"
+                f"\n\t=> Accuracy: {test_accuracy * 100:.2f}%"
                 f"\n\t=> Precision: {test_precision:.4f}"
                 f"\n\t=> Recall: {test_recall:.4f}"
                 f"\n\t=> F1: {test_f1:.4f}"
-                f"\n\t=> Round time: {round_time:.2f} sec\n"
+                f"\n\t=> Round time: {round_time:.2f} sec"
             )
 
-            print(message)
+            print(message, flush=True)
             logging.info(message)
+
+            # -----------------------------------------------------
+            # Save checkpoint AFTER the complete round.
+            # -----------------------------------------------------
+            checkpoint_path = os.path.join(
+                checkpoint_dir,
+                f"checkpoint_round_{self._round:04d}.pth"
+            )
+
+            self.save_checkpoint(checkpoint_path)
 
             del message
             gc.collect()
 
-        # Total experiment time
         total_time = time.perf_counter() - total_start
 
-        # Save experiment summary
-        with open("results/experiment_summary.txt", "w") as f:
+        logging.info(
+            f"Federated learning completed in "
+            f"{total_time:.2f} seconds."
+        )
 
-            f.write(
-                f"Total training time (sec): {total_time:.4f}\n"
-            )
-
-            f.write(
-                f"Total rounds: {self.num_rounds}\n"
-            )
-
-            f.write(
-                f"Average round time (sec): "
-                f"{sum(self.results['round_time']) / len(self.results['round_time']):.4f}\n"
-            )
-
-            f.write(
-                f"Final loss: "
-                f"{self.results['loss'][-1]:.6f}\n"
-            )
-
-            f.write(
-                f"Final accuracy: "
-                f"{self.results['accuracy'][-1]:.6f}\n"
-            )
-
-            f.write(
-                f"Final precision: "
-                f"{self.results['precision'][-1]:.6f}\n"
-            )
-
-            f.write(
-                f"Final recall: "
-                f"{self.results['recall'][-1]:.6f}\n"
-            )
-
-            f.write(
-                f"Final F1: "
-                f"{self.results['f1'][-1]:.6f}\n"
-            )
-
-        self.transmit_model()
+        print(
+            f"Federated learning completed in "
+            f"{total_time:.2f} seconds.",
+            flush=True
+        )

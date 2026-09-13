@@ -1,0 +1,72 @@
+global_config:
+  seed: 5959
+  device: "cuda:0"
+  is_mp: False
+
+---
+data_config:
+  data_path: "../../data/"
+  dataset_name: "NWPU"
+  num_shards: 200
+  iid: False
+  diri: True
+  alpha: 0.5
+
+---
+fed_config:
+  C: 0.24
+  K: 42
+  R: 1000
+  E: 5
+  B: 10
+  criterion: torch.nn.CrossEntropyLoss
+  optimizer: torch.optim.SGD
+
+---
+optim_config:
+  lr: 0.05
+  momentum: 0.9
+
+---
+init_config:
+  init_type: "xavier"
+  init_gain: 1.0
+  gpu_ids: [0]
+
+---
+model_config:
+  name: ResNet18
+  inplanes: 64
+  num_classes: 45
+
+---
+log_config:
+  log_path: "./log/"
+  log_name: "FL.log"
+  tb_port: 5255
+  tb_host: "0.0.0.0"
+
+---
+cl_config:
+  cl_dim: 2048
+  cl_gamma: 0.05
+  cl_temp: 0.05
+  cl_K: 50
+
+---
+loss_config:
+  loss: "ccloss"
+
+---
+adaptive_gamma:
+  enabled: true
+  gamma_min: 0.02
+  gamma_max: 0.10
+  baseline_gamma: 0.05
+  entropy_normalized: true
+
+---
+decorrelation_config:
+  enabled: true
+  lambda: 0.01
+  num_features: 256

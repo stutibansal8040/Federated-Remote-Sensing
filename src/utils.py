@@ -102,7 +102,7 @@ class CustomTensorDataset_CL(Dataset):
         assert all(tensors[0].size(0) == tensor.size(0) for tensor in tensors)
         self.tensors = tensors
         self.transform = transform
-        self.cls_num = 21
+        self.cls_num = 45
         self.targets = self.tensors[1]
 
     def __getitem__(self, index):
@@ -246,7 +246,7 @@ def create_datasets_CL(data_path, dataset_name, num_clients, num_shards, iid, di
     ]
 
     if dataset_name == "UCML":
-        num_classes = 21
+        num_classes = 45
         ROOT_TRAIN = data_path + dataset_name + '/train'
         ROOT_TEST = data_path +  dataset_name + '/val'
         normalize = transforms.Normalize(mean=[0.48422759, 0.49005176, 0.45050278],
@@ -298,7 +298,7 @@ def create_datasets_CL(data_path, dataset_name, num_clients, num_shards, iid, di
             targets.append(training_dataset[i][1])
         training_dataset.data = data
         training_dataset.targets = targets
-        num_categories = 21
+        num_categories = 45
     elif dataset_name == 'NWPU':
         data = np.ndarray((len(training_dataset),256,256,3))
         targets = []
